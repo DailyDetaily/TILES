@@ -40,6 +40,7 @@ struct MaterialOrganizerApp: App {
     @StateObject private var model: AppModel
     @StateObject private var review: ProjectReviewModel
     @StateObject private var watch: FolderWatchService
+    @StateObject private var scope: ScopeSelectionModel
     init() {
         Theme.registerFonts()
         let model = AppModel()
@@ -50,10 +51,11 @@ struct MaterialOrganizerApp: App {
         _model = StateObject(wrappedValue: model)
         _review = StateObject(wrappedValue: review)
         _watch = StateObject(wrappedValue: watch)
+        _scope = StateObject(wrappedValue: ScopeSelectionModel(owner: model))
     }
     var body: some Scene {
         Window("TILES", id: "main") {
-            OrganizerMainWindow(model: model, review: review, watch: watch, delegate: delegate)
+            OrganizerMainWindow(model: model, review: review, watch: watch, scope: scope, delegate: delegate)
                 .frame(minWidth: 1060, minHeight: 688)
                 .preferredColorScheme(.light)
 
@@ -62,8 +64,14 @@ struct MaterialOrganizerApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("정리할 파일 선택…") { model.chooseFile() }.keyboardShortcut("o").disabled(model.busy)
-                Button("폴더 전체 정리…") { model.showFolderBatch = true; model.page = .organize }.keyboardShortcut("o", modifiers: [.command, .shift]).disabled(model.busy)
+                Button("정리할 파일 선택…") {
+                    review.returnToInbox(); model.showFolderBatch = false; model.page = .organize
+                    model.openMainWindow?(); scope.setMode(.files); scope.chooseFiles()
+                }.keyboardShortcut("o").disabled(model.busy)
+                Button("정리할 폴더 선택…") {
+                    review.returnToInbox(); model.showFolderBatch = false; model.page = .organize
+                    model.openMainWindow?(); scope.setMode(.folders); scope.addFolders()
+                }.keyboardShortcut("o", modifiers: [.command, .shift]).disabled(model.busy)
                 Button("다시 분석") { model.analyze() }.keyboardShortcut("r").disabled(model.busy || !model.showFolderBatch || model.sources.isEmpty || !model.overlayDestinationConnected)
             }
         }
@@ -80,10 +88,11 @@ private struct OrganizerMainWindow: View {
     @ObservedObject var model: AppModel
     @ObservedObject var review: ProjectReviewModel
     @ObservedObject var watch: FolderWatchService
+    @ObservedObject var scope: ScopeSelectionModel
     let delegate: AppDelegate
     @Environment(\.openWindow) private var openWindow
     var body: some View {
-        ContentView(model: model, review: review, watch: watch).onAppear {
+        ContentView(model: model, review: review, watch: watch, scope: scope).onAppear {
             let action = openWindow
             model.openMainWindow = { action(id: "main") }
             delegate.model = model

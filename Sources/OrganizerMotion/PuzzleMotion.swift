@@ -3,6 +3,9 @@ import Foundation
 public enum PuzzlePage: String, CaseIterable, Sendable {
     case organize = "정리", history = "기록", rules = "규칙"
 }
+public enum PuzzlePhase: String, CaseIterable, Sendable {
+    case intake, recommendation, preview, completion
+}
 public enum PuzzleTile: String, CaseIterable, Hashable, Sendable {
     case source, destination, headline, total, metrics, workspace, action, guide
 }
@@ -21,13 +24,37 @@ public struct GridRect: Equatable, Hashable, Sendable {
 public struct PuzzleBoard: Equatable, Sendable {
     public var tiles: [PuzzleTile: GridRect]
     public subscript(_ tile: PuzzleTile) -> GridRect { get { tiles[tile]! } set { tiles[tile] = newValue } }
-    public static func resting(page: PuzzlePage, expanded: Bool) -> Self {
+    public static func resting(page: PuzzlePage, expanded: Bool, phase: PuzzlePhase = .intake) -> Self {
         let slots = PuzzleRoute.slots
-        let order: [PuzzleTile] = page == .organize ? [.total, .metrics, .action] : page == .history ? [.action, .total, .metrics] : [.metrics, .action, .total]
+        let order: [PuzzleTile]
+        let workspaceExpanded: Bool
+        switch page {
+        case .organize:
+            switch phase {
+            case .intake:
+                order = [.total, .metrics, .action]
+                workspaceExpanded = expanded
+            case .recommendation:
+                order = [.metrics, .action, .total]
+                workspaceExpanded = true
+            case .preview:
+                order = [.action, .total, .metrics]
+                workspaceExpanded = true
+            case .completion:
+                order = [.total, .metrics, .action]
+                workspaceExpanded = false
+            }
+        case .history:
+            order = [.action, .total, .metrics]
+            workspaceExpanded = expanded
+        case .rules:
+            order = [.metrics, .action, .total]
+            workspaceExpanded = expanded
+        }
         var tiles: [PuzzleTile: GridRect] = [
             .source: .init(0, 0, 1, 2), .destination: .init(0, 2, 1, 2),
-            .headline: .init(1, 0, 3, 1), .workspace: .init(1, 1, expanded ? 4 : 3, 3),
-            .guide: expanded ? .init(5, 2, 1, 2) : .init(4, 1, 1, 3)
+            .headline: .init(1, 0, 3, 1), .workspace: .init(1, 1, workspaceExpanded ? 4 : 3, 3),
+            .guide: workspaceExpanded ? .init(5, 2, 1, 2) : .init(4, 1, 1, 3)
         ]
         for index in 0..<3 { tiles[order[index]] = slots[index] }
         return .init(tiles: tiles)

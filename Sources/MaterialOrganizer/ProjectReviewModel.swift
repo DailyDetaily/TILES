@@ -26,6 +26,8 @@ struct ProjectReviewState: Codable {
     var workspaceRootPath: String?
     var contentEnabled = true
     var batches: [ReviewQueuedBatch] = []
+    /// Absent in older states. Managed locations never supply semantic project evidence.
+    var automaticLocationRoots: [UUID: String]?
 }
 
 struct ProjectReviewRow: Identifiable {
@@ -41,6 +43,7 @@ struct ProjectReviewRow: Identifiable {
 
 @MainActor final class ProjectReviewModel: ObservableObject {
     @Published private(set) var projects: [ProjectDefinition] = []
+    @Published private(set) var automaticLocationRoots: [UUID: String] = [:]
     @Published private(set) var workspaceRoot: URL?
     @Published private(set) var batches: [ReviewQueuedBatch] = []
     @Published private(set) var rows: [ProjectReviewRow] = []
@@ -93,11 +96,30 @@ struct ProjectReviewRow: Identifiable {
         return creation.paths.filter { creation.existingIdentities[$0] == nil }
     }
     func project(_ id: UUID?) -> ProjectDefinition? { projects.first { $0.id == id } }
-    func projectName(_ row: ProjectReviewRow) -> String { project(row.projectID)?.name ?? "프로젝트 확인 필요" }
-    func destination(_ row: ProjectReviewRow) -> String? {
+    var savedProjects: [ProjectDefinition] { projects.filter { !isAutomaticLocation($0.id) } }
+    func isAutomaticLocation(_ id: UUID?) -> Bool { id.map { automaticLocationRoots[$0] != nil } ?? false }
+    func projectName(_ row: ProjectReviewRow) -> String {
+        guard let project = project(row.projectID) else { return "위치 확인 필요" }
+        return isAutomaticLocation(project.id) ? URL(fileURLWithPath: project.rootPath).lastPathComponent : project.name
+    }
+    func destinationFolder(_ row: ProjectReviewRow) -> String? {
         guard let project = project(row.projectID), let folder = row.folder else { return nil }
         let root = URL(fileURLWithPath: project.rootPath)
-        return (folder.isEmpty ? root : root.appendingPathComponent(folder)).appendingPathComponent(row.evidence.name).path
+        return (folder.isEmpty ? root : root.appendingPathComponent(folder)).path
+    }
+    func destination(_ row: ProjectReviewRow) -> String? {
+        destinationFolder(row).map { URL(fileURLWithPath: $0).appendingPathComponent(row.evidence.name).path }
+    }
+    func recommendationReason(_ row: ProjectReviewRow) -> String {
+        if row.explicitlyAssigned, row.folder != nil { return "직접 지정한 정리 위치" }
+        if isAutomaticLocation(row.projectID) {
+            return "프로젝트 단서가 없어 원래 위치 안에서 확장자 기준으로 \(row.evidence.kind.label) 폴더를 추천했습니다."
+        }
+        if let id = row.projectID, let candidate = row.evidence.projectCandidates.first(where: { $0.projectID == id }) {
+            return candidate.reasons.joined(separator: " · ")
+        }
+        if row.evidence.projectMatch == .ambiguous { return "여러 프로젝트 단서가 겹칩니다. 정리할 위치를 선택해 주세요." }
+        return row.evidence.reasons.last ?? "정리할 위치를 확인해 주세요."
     }
 
     func setContentEnabled(_ enabled: Bool) {
@@ -236,7 +258,7 @@ struct ProjectReviewRow: Identifiable {
                !stale, PathSafety.lexicalURL(url).path == file.path { acquireScope(url) }
         }
         let generation = UUID(); self.generation = generation
-        let projects = projects, content = contentEnabled
+        let projects = savedProjects, content = contentEnabled
         isAnalyzing = true; isPreparing = false; preparedPlan = nil; failure = nil; notice = nil
         analysisTask = Task { [weak self] in
             let evidence = await ProjectFileAnalyzer.analyze(urls: savedFiles.map { URL(fileURLWithPath: $0.path) }, projects: projects,
@@ -245,13 +267,25 @@ struct ProjectReviewRow: Identifiable {
                 })
             guard let self, self.generation == generation else { return }
             self.isAnalyzing = false; self.owner.finishReviewPreparation(cancellation.cancelled ? CancellationError() : nil)
-            self.rows = evidence.map { value in
+            self.rows = evidence.map { original in
+                var value = original
                 let saved = savedFiles.first { $0.path == value.sourcePath }
                 let changed = saved?.version != nil && saved?.version != value.sourceVersion
                 let savedProject = changed ? nil : self.project(saved?.projectID)
                 let candidate = value.projectMatch == .unique ? self.project(value.projectCandidates.first?.projectID) : nil
-                let selectedProject = savedProject ?? candidate
-                var folder = savedProject != nil ? saved?.folder : nil
+                // Re-evaluate automatic fallbacks when project evidence changes. Explicit choices survive.
+                let preserved = savedProject.flatMap { project in
+                    self.isAutomaticLocation(project.id) && !(saved?.explicitlyAssigned ?? false) ? nil : project
+                }
+                var selectedProject = preserved ?? candidate
+                var folder = preserved != nil ? saved?.folder : nil
+                if selectedProject == nil, value.projectMatch == .unknown,
+                   value.sourceIdentity != nil, value.readStatus != .cancelled, value.readStatus != .invalidFile {
+                    do {
+                        selectedProject = try self.managedLocation(at: URL(fileURLWithPath: value.sourcePath).deletingLastPathComponent())
+                        value.reasons.append("프로젝트 단서가 없어 원래 위치 안에서 파일 종류별 폴더를 추천했습니다.")
+                    } catch { value.reasons.append("자동 정리 위치를 준비할 수 없습니다. \(error.localizedDescription)") }
+                }
                 if let existing = folder, !existing.isEmpty, let project = selectedProject,
                    !project.folders.contains(existing), project.template != .byMonth { folder = nil }
                 if folder == nil, let project = selectedProject { folder = value.suggestedFolder(for: project) }
@@ -287,8 +321,54 @@ struct ProjectReviewRow: Identifiable {
         for index in rows.indices where rowID == rows[index].id || (rowID == nil && rows[index].included) {
             guard let project = project(rows[index].projectID), folder.isEmpty || project.folders.contains(folder) || project.template == .byMonth else { continue }
             rows[index].folder = folder
+            rows[index].explicitlyAssigned = true
         }
         choicesChanged()
+    }
+
+    func chooseDestinationFolder(for rowID: UUID? = nil) {
+        guard !owner.busy, storeReadable else { return }
+        let panel = NSOpenPanel(); panel.title = "정리할 위치 선택"; panel.prompt = "이 위치로 정리"
+        panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+        if let row = rows.first(where: { $0.id == rowID }), let path = destinationFolder(row) {
+            panel.directoryURL = try? SafeFileSystem.nearestExistingDirectory(URL(fileURLWithPath: path))
+        }
+        if panel.runModal() == .OK, let url = panel.url { _ = assignExistingDestination(url, to: rowID) }
+    }
+
+    @discardableResult func assignExistingDestination(_ url: URL, to rowID: UUID? = nil) -> Bool {
+        guard !owner.busy, storeReadable else { return false }
+        let affected = rows.indices.filter { rowID == rows[$0].id || (rowID == nil && rows[$0].included) }
+        guard !affected.isEmpty else { return false }
+        let previous = mutationSnapshot()
+        do {
+            let location = try managedLocation(at: url)
+            guard !affected.contains(where: { URL(fileURLWithPath: rows[$0].evidence.sourcePath).deletingLastPathComponent().path == location.rootPath }) else {
+                throw OrganizerError("선택한 파일이 이미 이 폴더에 있습니다. 다른 위치를 선택해 주세요.")
+            }
+            for index in affected {
+                rows[index].projectID = location.id; rows[index].folder = ""; rows[index].explicitlyAssigned = true
+            }
+            invalidatePlan(); saveActiveChoices()
+            guard persist() else { restore(previous); return false }
+            owner.remember(url); failure = nil
+            return true
+        } catch { restore(previous); failure = error.localizedDescription; return false }
+    }
+
+    /// An internal routing record, not a discovered project or a change to the filesystem.
+    private func managedLocation(at url: URL) throws -> ProjectDefinition {
+        guard Self.isLocalFileURL(url), let destination = QuickFolderSuggestions.destination(url, rules: owner.rules),
+              try URL(fileURLWithPath: destination.path).resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal == true else {
+            throw OrganizerError("이 Mac에서 읽고 쓸 수 있는 정리 위치를 선택해 주세요.")
+        }
+        if let existing = projects.first(where: { automaticLocationRoots[$0.id] == destination.path }) { return existing }
+        guard projects.count < 100 else { throw OrganizerError("저장된 정리 위치가 100개여서 새 위치를 추천할 수 없습니다.") }
+        let project = ProjectDefinition(name: "자동 정리 위치", rootPath: destination.path, template: .byKind)
+        try project.validate()
+        projects.append(project); automaticLocationRoots[project.id] = destination.path
+        return project
     }
     private func choicesChanged() { invalidatePlan(); saveActiveChoices(); persist() }
     private func invalidatePlan() { preparedPlan = nil; plannedVersions = [:]; preparingProjectIDs = [] }
@@ -299,7 +379,7 @@ struct ProjectReviewRow: Identifiable {
         do {
             var project = definition; project.folders = try ProjectFolderTree.normalized(project.folders); try project.validate()
             guard projects.count < 100 || projects.contains(where: { $0.id == project.id }) else { throw OrganizerError("프로젝트는 100개까지 저장할 수 있습니다.") }
-            guard !projects.contains(where: { $0.id != project.id && $0.rootPath.precomposedStringWithCanonicalMapping.lowercased() == project.rootPath.precomposedStringWithCanonicalMapping.lowercased() }) else {
+            guard !savedProjects.contains(where: { $0.id != project.id && $0.rootPath.precomposedStringWithCanonicalMapping.lowercased() == project.rootPath.precomposedStringWithCanonicalMapping.lowercased() }) else {
                 throw OrganizerError("같은 위치의 프로젝트가 이미 있습니다. 기존 프로젝트를 선택해 주세요.")
             }
             let root = URL(fileURLWithPath: project.rootPath)
@@ -335,11 +415,13 @@ struct ProjectReviewRow: Identifiable {
         let chosenRows = projectID == nil ? rows.filter(\.isReady) : []
         let ids = projectID.map { Set([$0]) } ?? Set(chosenRows.compactMap(\.projectID))
         let targets = projects.filter { ids.contains($0.id) }
-        guard !targets.isEmpty, !chosenRows.isEmpty || projectID != nil else { failure = "프로젝트와 옮길 폴더를 먼저 선택해 주세요."; return }
+        guard !targets.isEmpty, !chosenRows.isEmpty || projectID != nil else { failure = "정리할 위치를 먼저 확인해 주세요."; return }
         guard let cancellation = owner.beginReviewPreparation("이동안과 만들 폴더를 확인합니다…") else { return }
         isPreparing = true; failure = nil; lastRun = nil; saveActiveChoices(); persist()
         owner.projectReviewActive = true; owner.showFolderBatch = false; owner.page = .organize
         let config = owner.rules, authorized = owner.overlayAuthorizedSources
+        let automaticIDs = Set(automaticLocationRoots.keys)
+        let reasons = Dictionary(uniqueKeysWithValues: chosenRows.map { ($0.evidence.sourcePath, recommendationReason($0)) })
         let generation = UUID(); self.generation = generation
         Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) { () -> Result<ScanPlan, Error> in
@@ -350,7 +432,10 @@ struct ProjectReviewRow: Identifiable {
                     for project in targets {
                         try project.validate()
                         let url = URL(fileURLWithPath: project.rootPath)
-                        required.append(url); required += project.folders.map { url.appendingPathComponent($0, isDirectory: true) }
+                        required.append(url)
+                        if !automaticIDs.contains(project.id) {
+                            required += project.folders.map { url.appendingPathComponent($0, isDirectory: true) }
+                        }
                     }
                     var assignments: [SelectedFileDestination] = []
                     for row in chosenRows {
@@ -363,10 +448,13 @@ struct ProjectReviewRow: Identifiable {
                         guard PathSafety.contains(projectRoot, target) else { throw OrganizerError("목적지가 프로젝트 밖에 있습니다.") }
                         assignments.append(.init(source: URL(fileURLWithPath: row.evidence.sourcePath), folder: target, expectedSourceIdentity: row.evidence.sourceIdentity))
                     }
-                    let plan = try SelectedFilesPlanner.plan(assignments: assignments, destinationRoot: root, authorizedSources: authorized,
+                    var plan = try SelectedFilesPlanner.plan(assignments: assignments, destinationRoot: root, authorizedSources: authorized,
                         rules: config, requiredDirectories: required, cancelled: { cancellation.cancelled }, progress: { value in
                             Task { @MainActor [weak self] in self?.owner.progress = value }
                         })
+                    for index in plan.proposals.indices {
+                        plan.proposals[index].reason = reasons[plan.proposals[index].source] ?? plan.proposals[index].reason
+                    }
                     for row in chosenRows where try !row.evidence.matchesCurrentSource() {
                         throw OrganizerError("미리보기를 만드는 중 원본이 바뀌었습니다: \(row.evidence.name)")
                     }
@@ -407,6 +495,7 @@ struct ProjectReviewRow: Identifiable {
                     if self.batches[index].files.isEmpty { self.batches.remove(at: index) }
                 }
                 self.notice = run.state == .completed ? "\(run.movedCount)개 파일 이동 · \(run.createdDirectories.count)개 폴더 생성" : (run.message ?? "일부 항목만 처리했습니다. 기록을 확인해 주세요.")
+                self.pruneUnusedAutomaticLocations()
                 self.persist(); self.owner.persist()
             case .failure(let error): self.failure = error is CancellationError ? "실행을 중단했습니다." : error.localizedDescription
             }
@@ -460,6 +549,7 @@ struct ProjectReviewRow: Identifiable {
 
     private struct MutationSnapshot {
         var projects: [ProjectDefinition]
+        var automaticLocationRoots: [UUID: String]
         var batches: [ReviewQueuedBatch]
         var rows: [ProjectReviewRow]
         var activeBatchID: UUID?
@@ -471,13 +561,13 @@ struct ProjectReviewRow: Identifiable {
     }
 
     private func mutationSnapshot() -> MutationSnapshot {
-        .init(projects: projects, batches: batches, rows: rows, activeBatchID: activeBatchID, lastRun: lastRun,
+        .init(projects: projects, automaticLocationRoots: automaticLocationRoots, batches: batches, rows: rows, activeBatchID: activeBatchID, lastRun: lastRun,
               plan: preparedPlan, projectIDs: preparingProjectIDs, versions: plannedVersions, notice: notice)
     }
 
     /// Keep the new persistence error visible while restoring the last usable in-memory state.
     private func restore(_ snapshot: MutationSnapshot) {
-        projects = snapshot.projects; batches = snapshot.batches; rows = snapshot.rows
+        projects = snapshot.projects; automaticLocationRoots = snapshot.automaticLocationRoots; batches = snapshot.batches; rows = snapshot.rows
         activeBatchID = snapshot.activeBatchID; lastRun = snapshot.lastRun; preparedPlan = snapshot.plan
         preparingProjectIDs = snapshot.projectIDs; plannedVersions = snapshot.versions; notice = snapshot.notice
     }
@@ -487,6 +577,15 @@ struct ProjectReviewRow: Identifiable {
         let bookmarks = Dictionary(batches[index].files.compactMap { file in file.bookmark.map { (file.path, $0) } }, uniquingKeysWith: { first, _ in first })
         batches[index].files = rows.map { .init(path: $0.evidence.sourcePath, projectID: $0.projectID, folder: $0.folder,
             included: $0.included, version: $0.evidence.sourceVersion, explicitlyAssigned: $0.explicitlyAssigned, bookmark: bookmarks[$0.evidence.sourcePath]) }
+        pruneUnusedAutomaticLocations()
+    }
+
+    private func pruneUnusedAutomaticLocations() {
+        let retained = Set(batches.flatMap { $0.files.compactMap(\.projectID) })
+            .union(lastRun == nil ? rows.compactMap(\.projectID) : [])
+        let obsolete = Set(automaticLocationRoots.keys).subtracting(retained)
+        projects.removeAll { obsolete.contains($0.id) }
+        for id in obsolete { automaticLocationRoots.removeValue(forKey: id) }
     }
 
     private func load() {
@@ -499,14 +598,16 @@ struct ProjectReviewRow: Identifiable {
             guard data.count <= Self.maximumStoredBytes else { throw OrganizerError("대기 목록이 저장 한도를 넘었습니다.") }
             let state = try JSONDecoder().decode(ProjectReviewState.self, from: data)
             try validateState(state)
-            projects = state.projects; batches = state.batches; contentEnabled = state.contentEnabled
+            projects = state.projects; automaticLocationRoots = state.automaticLocationRoots ?? [:]
+            batches = state.batches; contentEnabled = state.contentEnabled
             workspaceRoot = state.workspaceRootPath.map { URL(fileURLWithPath: $0) } ?? workspaceRoot
         } catch { storeReadable = false; failure = "프로젝트 설정을 읽지 못해 원본 설정을 보존했습니다. \(error.localizedDescription)" }
     }
     @discardableResult func persist() -> Bool {
         guard storeReadable else { return false }
         do {
-            let state = ProjectReviewState(projects: projects, workspaceRootPath: workspaceRoot?.path, contentEnabled: contentEnabled, batches: batches)
+            let state = ProjectReviewState(projects: projects, workspaceRootPath: workspaceRoot?.path, contentEnabled: contentEnabled, batches: batches,
+                                           automaticLocationRoots: automaticLocationRoots.isEmpty ? nil : automaticLocationRoots)
             try validateState(state)
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(state)
@@ -523,6 +624,12 @@ struct ProjectReviewRow: Identifiable {
             throw OrganizerError("프로젝트는 100개, 대기 묶음은 200개까지 저장할 수 있으며 항목 ID가 겹치면 안 됩니다.")
         }
         for project in state.projects { try project.validate() }
+        for (id, root) in state.automaticLocationRoots ?? [:] {
+            guard let project = state.projects.first(where: { $0.id == id }), project.rootPath == root,
+                  project.template == .byKind, project.aliases.isEmpty else {
+                throw OrganizerError("자동 정리 위치의 저장 정보가 일치하지 않습니다.")
+            }
+        }
         for batch in state.batches {
             guard batch.files.count <= 500, Set(batch.files.map(\.path)).count == batch.files.count,
                   batch.files.allSatisfy({ $0.path.hasPrefix("/") && !$0.path.contains("\u{0}") }) else {

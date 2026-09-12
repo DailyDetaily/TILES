@@ -9,8 +9,8 @@ import OrganizerMotion
     private var initialized = false
     private var generation = 0
 
-    func request(page: PuzzlePage, expanded: Bool, reduced: Bool) {
-        destination = .resting(page: page, expanded: expanded)
+    func request(page: PuzzlePage, expanded: Bool, phase: PuzzlePhase = .intake, reduced: Bool) {
+        destination = .resting(page: page, expanded: expanded, phase: phase)
         if reduced || !initialized {
             initialized = true; generation += 1; runner?.cancel(); runner = nil
             var transaction = Transaction(); transaction.disablesAnimations = true
@@ -42,4 +42,3 @@ import OrganizerMotion
     }
     func stop() { generation += 1; runner?.cancel(); runner = nil; isRouting = false }
 }
-
