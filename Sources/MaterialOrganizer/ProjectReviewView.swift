@@ -74,9 +74,9 @@ struct ProjectReviewView: View {
             HStack(spacing: 12) {
                 Button { review.newProject() } label: { Label("프로젝트 만들기", systemImage: "folder.badge.plus") }
                     .buttonStyle(.plain).font(Theme.body(12)).accessibilityIdentifier("new-project")
-                if !review.projects.isEmpty {
-                    Menu("프로젝트 \(review.projects.count)개") {
-                        ForEach(review.projects) { project in Button(project.name) { review.editProject(project) } }
+                if !review.savedProjects.isEmpty {
+                    Menu("프로젝트 \(review.savedProjects.count)개") {
+                        ForEach(review.savedProjects) { project in Button(project.name) { review.editProject(project) } }
                     }.font(Theme.body(12)).fixedSize()
                 }
                 Spacer()
@@ -140,89 +140,46 @@ struct ProjectReviewView: View {
     private var reviewFiles: some View {
         VStack(alignment: .leading, spacing: 13) {
             HStack(alignment: .firstTextBaseline) {
-                Text("\(review.rows.count)개 파일").font(Theme.body(18)).fontWeight(.medium)
-                Text("\(review.readyCount)개 준비 · \(review.unresolvedCount)개 확인 필요").font(Theme.body(11)).foregroundStyle(Theme.gray)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("추천된 정리 위치").font(Theme.body(19)).fontWeight(.semibold)
+                    Text("\(review.readyCount)개 준비 · \(review.unresolvedCount)개 위치 확인 필요").font(Theme.body(11)).foregroundStyle(Theme.gray)
+                }
                 Spacer()
-                Button("다시 분석", action: review.analyzeActive).buttonStyle(.plain).font(Theme.body(11)).disabled(owner.busy)
+                Menu {
+                    Button("다시 분석", action: review.analyzeActive)
+                    Toggle("파일 내용도 확인", isOn: Binding(get: { review.contentEnabled }, set: { review.setContentEnabled($0) }))
+                    Button("프로젝트로 정리 방식 저장", action: review.newProject)
+                } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28) }
+                    .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("추천 설정").disabled(owner.busy)
             }
             HStack(spacing: 12) {
-                Toggle("내용 확인", isOn: Binding(get: { review.contentEnabled }, set: { review.setContentEnabled($0) }))
-                    .toggleStyle(.checkbox).font(Theme.body(11)).help("이 기기에서 지원 문서의 텍스트와 이미지 OCR을 확인합니다. 외부 서버로 보내지 않습니다.")
-                Text("기기 안에서 분석").font(Theme.body(10)).foregroundStyle(Theme.gray)
+                Toggle("전체 포함", isOn: Binding(get: { !review.rows.isEmpty && review.rows.allSatisfy(\.included) }, set: { review.includeAll($0) }))
+                    .toggleStyle(.checkbox).font(Theme.body(11)).accessibilityIdentifier("review-include-all")
                 Spacer()
-                Button("프로젝트 추가", action: review.newProject).buttonStyle(.plain).font(Theme.body(11)).accessibilityIdentifier("new-project")
+                Button("포함한 파일의 위치 변경…") { review.chooseDestinationFolder() }
+                    .buttonStyle(.plain).font(Theme.body(11)).disabled(!review.rows.contains(where: \.included))
+                    .accessibilityIdentifier("review-bulk-destination")
             }.disabled(owner.busy)
-            Hairline().opacity(0.6)
-            assignmentBar
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    if review.projects.isEmpty {
-                        HStack(spacing: 12) {
-                            Text("프로젝트와 정리 방식을 먼저 선택하세요.").font(Theme.body(12))
-                            Spacer()
-                            Button("프로젝트 만들기", action: review.newProject).buttonStyle(PillStyle(filled: false))
-                        }.padding(14).background(Theme.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-                    }
-                    ForEach(groupKeys, id: \.self) { key in
-                        let grouped = review.rows.filter { review.projectName($0) == key }
-                        Text("\(key) · \(grouped.count)개").font(Theme.body(11)).foregroundStyle(Theme.gray).padding(.top, 5)
-                        ForEach(grouped) { row in
-                            ProjectReviewFileRow(review: review, owner: owner, rowID: row.id, preview: { previewURL = $0 })
-                        }
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ProjectReviewAssistanceView(review: review, owner: owner)
+                    // Stable row identity/order: editing a destination never moves another file.
+                    ForEach(review.rows) { row in
+                        ProjectReviewFileRow(review: review, owner: owner, rowID: row.id, preview: { previewURL = $0 })
                     }
                 }.padding(.trailing, 2)
             }
-            HStack(spacing: 14) {
-                Button("나중에", action: review.returnToInbox).buttonStyle(PillStyle(filled: false)).disabled(owner.busy)
-                Spacer()
-                if review.unresolvedCount > 0 { Text("확인 필요한 파일은 남겨둡니다").font(Theme.body(10)).foregroundStyle(Theme.gray) }
-                Button("\(review.readyCount)개 이동안 확인") { review.prepare() }
-                    .buttonStyle(PillStyle()).disabled(!review.canPreview).accessibilityIdentifier("review-prepare")
-            }
-        }
-    }
-
-    private var groupKeys: [String] {
-        let names = Set(review.rows.map { review.projectName($0) })
-        return names.sorted { a, b in a == "프로젝트 확인 필요" ? false : b == "프로젝트 확인 필요" ? true : a.localizedStandardCompare(b) == .orderedAscending }
-    }
-
-    private var assignmentBar: some View {
-        ViewThatFits(in: .horizontal) {
             HStack(spacing: 12) {
-                inclusionControl
-                assignmentMenus
+                if !embedded {
+                    Button("나중에", action: review.returnToInbox).buttonStyle(PillStyle(filled: false)).disabled(owner.busy)
+                }
+                Text(review.unresolvedCount > 0 ? "위치가 정해진 파일만 정리합니다." : "추천이 맞으면 이동안을 확인하세요.")
+                    .font(Theme.body(11)).foregroundStyle(Theme.gray)
                 Spacer(minLength: 0)
-            }.frame(minWidth: 430)
-            VStack(alignment: .leading, spacing: 8) {
-                inclusionControl
-                assignmentMenus
-            }
-        }.disabled(owner.busy)
-    }
-
-    private var inclusionControl: some View {
-        HStack(spacing: 12) {
-            Toggle("전체", isOn: Binding(get: { !review.rows.isEmpty && review.rows.allSatisfy(\.included) }, set: { review.includeAll($0) }))
-                .toggleStyle(.checkbox).font(Theme.body(11)).accessibilityIdentifier("review-include-all")
-            Text("포함한 파일에 적용").font(Theme.body(10)).foregroundStyle(Theme.gray)
-        }
-    }
-
-    private var assignmentMenus: some View {
-        HStack(spacing: 12) {
-            Menu {
-                ForEach(review.projects) { project in Button(project.name) { review.assignProject(project.id) } }
-            } label: { Label("프로젝트", systemImage: "folder") }
-                .font(Theme.body(12)).fixedSize().disabled(review.projects.isEmpty || !review.rows.contains(where: \.included))
-                .accessibilityIdentifier("review-bulk-project")
-            if let project = review.singleSelectedProject {
-                Menu {
-                    Button("프로젝트 폴더에 두기") { review.assignFolder("") }
-                    Divider()
-                    ForEach(project.folders, id: \.self) { path in Button(path) { review.assignFolder(path) } }
-                } label: { Label("하위 폴더", systemImage: "folder.badge.gearshape") }
-                    .font(Theme.body(12)).fixedSize().accessibilityIdentifier("review-bulk-folder")
+                if !embedded {
+                    Button("\(review.readyCount)개 이동안 확인") { review.prepare() }
+                        .buttonStyle(PillStyle()).disabled(!review.canPreview).accessibilityIdentifier("review-prepare")
+                }
             }
         }
     }
@@ -266,7 +223,7 @@ struct ProjectReviewView: View {
                 Button("돌아가기", action: review.backToReview).buttonStyle(PillStyle(filled: false)).disabled(owner.busy)
                 Spacer()
                 if owner.busy { ProgressView().controlSize(.small); Button("중단", action: owner.cancel).buttonStyle(PillStyle(filled: false)) }
-                else {
+                else if !embedded {
                     Button(executeLabel(plan), action: review.executePrepared).buttonStyle(PillStyle())
                         .disabled(plan.proposals.isEmpty && review.newDirectoryPaths.isEmpty).accessibilityIdentifier("review-execute")
                 }
@@ -288,11 +245,16 @@ struct ProjectReviewView: View {
                 .font(Theme.body(21)).fontWeight(.medium)
             if run.state != .undone {
                 Text("파일 \(run.movedCount)개 이동 · 폴더 \(run.createdDirectories.count)개 생성").font(Theme.body(13)).foregroundStyle(Theme.gray)
+                let moved = Set(run.entries.filter { $0.state == .moved }.map(\.source))
+                let remaining = review.rows.filter { !moved.contains($0.evidence.sourcePath) }.count
+                if remaining > 0 { Text("\(remaining)개는 원래 위치에 남겨두었습니다.").font(Theme.body(12)).foregroundStyle(Theme.gray) }
             }
             if let message = run.message { Text(message).font(Theme.body(12)).multilineTextAlignment(.center).textSelection(.enabled) }
             HStack(spacing: 12) {
                 if run.canUndo { Button("되돌리기", action: review.undo).buttonStyle(PillStyle(filled: false)).accessibilityIdentifier("review-undo") }
-                Button("확인 대기", action: review.returnToInbox).buttonStyle(PillStyle()).accessibilityIdentifier("review-next")
+                if !embedded {
+                    Button("확인 대기", action: review.returnToInbox).buttonStyle(PillStyle()).accessibilityIdentifier("review-next")
+                }
             }.disabled(owner.busy)
             if let entry = run.entries.first {
                 Button("Finder에서 보기") { owner.showInFinder(run.state == .undone ? entry.source : entry.destination) }.buttonStyle(.plain).font(Theme.body(12))
@@ -342,25 +304,34 @@ private struct ProjectReviewFileRow: View {
 
     private func rowContent(_ row: ProjectReviewRow) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .center, spacing: 10) {
-                    fileIdentity(row)
-                    projectMenu(row).frame(width: 112)
-                    folderMenu(row).frame(width: 115)
-                    expandButton(row)
-                }.frame(minWidth: 620)
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(alignment: .center, spacing: 10) { fileIdentity(row); expandButton(row) }
-                    HStack(spacing: 12) {
-                        projectMenu(row).frame(maxWidth: .infinity, alignment: .leading)
-                        folderMenu(row).frame(maxWidth: .infinity, alignment: .leading)
-                    }.padding(.leading, 28)
-                }
+            HStack(alignment: .top, spacing: 10) {
+                fileIdentity(row)
+                expandButton(row)
             }
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: row.isReady ? "arrow.turn.down.right" : "questionmark.folder")
+                    .font(.system(size: 13)).foregroundStyle(Theme.gray).frame(width: 18)
+                VStack(alignment: .leading, spacing: 4) {
+                    if let path = review.destinationFolder(row) {
+                        PathText(path: path)
+                        Text(review.recommendationReason(row)).font(Theme.body(10)).foregroundStyle(Theme.gray).lineLimit(2)
+                    } else {
+                        Text("정리할 위치를 확인해 주세요").font(Theme.body(12)).fontWeight(.medium)
+                        Text(review.recommendationReason(row)).font(Theme.body(10)).foregroundStyle(Theme.gray).lineLimit(2)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+                Button("변경…") { review.chooseDestinationFolder(for: row.id) }
+                    .buttonStyle(.plain).font(Theme.body(11)).padding(.vertical, 3)
+                    .accessibilityLabel("\(row.evidence.name) 정리 위치 변경")
+                    .accessibilityIdentifier("row-destination-\(row.evidence.name)")
+            }.padding(.leading, 27)
             if expanded {
                 VStack(alignment: .leading, spacing: 7) {
                     PathText(path: row.evidence.sourcePath)
-                    if row.explicitlyAssigned { Text("직접 선택한 프로젝트").font(Theme.body(11)).fontWeight(.medium) }
+                    if row.explicitlyAssigned { Text("직접 선택한 정리 위치").font(Theme.body(11)).fontWeight(.medium) }
+                    if !review.savedProjects.isEmpty {
+                        HStack(spacing: 12) { projectMenu(row); folderMenu(row) }
+                    }
                     ForEach(Array(row.evidence.projectCandidates.enumerated()), id: \.offset) { _, candidate in
                         Text("\(candidate.projectName): \(candidate.reasons.joined(separator: " · "))").font(Theme.body(11))
                     }
@@ -378,7 +349,6 @@ private struct ProjectReviewFileRow: View {
             }
         }.padding(12)
             .background(row.included ? Color.white : Color.white.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(row.isReady ? Theme.blue.opacity(0.35) : Color.black.opacity(0.07), lineWidth: 1))
             .disabled(owner.busy).accessibilityIdentifier("review-file-\(row.evidence.name)")
     }
 
@@ -398,26 +368,23 @@ private struct ProjectReviewFileRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(row.evidence.name).font(Theme.body(12)).fontWeight(.medium).lineLimit(2).help(row.evidence.sourcePath)
                 Text(row.evidence.readStatus.label).font(Theme.body(10)).foregroundStyle(readStatusColor(row)).lineLimit(2)
-                if !row.explicitlyAssigned {
-                    Text(row.evidence.projectMatch.label).font(Theme.body(10)).foregroundStyle(Theme.gray).lineLimit(1)
-                }
             }.frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
     private func readStatusColor(_ row: ProjectReviewRow) -> Color {
         switch row.evidence.issueSeverity {
-        case .error: return .red
-        case .warning: return .orange
+        case .error: return .black
+        case .warning: return .black
         case .none, .notice: return Theme.gray
         }
     }
 
     private func projectMenu(_ row: ProjectReviewRow) -> some View {
         Menu {
-            ForEach(review.projects) { project in Button(project.name) { review.assignProject(project.id, to: rowID) } }
+            ForEach(review.savedProjects) { project in Button(project.name) { review.assignProject(project.id, to: rowID) } }
         } label: { Text(review.project(row.projectID)?.name ?? "프로젝트 선택").font(Theme.body(11)).lineLimit(1) }
-            .disabled(review.projects.isEmpty).accessibilityIdentifier("row-project-\(row.evidence.name)")
+            .disabled(review.savedProjects.isEmpty).accessibilityIdentifier("row-project-\(row.evidence.name)")
     }
 
     private func expandButton(_ row: ProjectReviewRow) -> some View {

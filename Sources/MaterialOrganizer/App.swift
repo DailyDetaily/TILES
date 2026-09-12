@@ -65,11 +65,11 @@ struct MaterialOrganizerApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("정리할 파일 선택…") {
-                    review.returnToInbox(); model.showFolderBatch = false; model.page = .organize
+                    review.returnToInbox(); model.resetQuickMove(); model.invalidate(); model.showFolderBatch = false; model.page = .organize
                     model.openMainWindow?(); scope.setMode(.files); scope.chooseFiles()
                 }.keyboardShortcut("o").disabled(model.busy)
                 Button("정리할 폴더 선택…") {
-                    review.returnToInbox(); model.showFolderBatch = false; model.page = .organize
+                    review.returnToInbox(); model.resetQuickMove(); model.invalidate(); model.showFolderBatch = false; model.page = .organize
                     model.openMainWindow?(); scope.setMode(.folders); scope.addFolders()
                 }.keyboardShortcut("o", modifiers: [.command, .shift]).disabled(model.busy)
                 Button("다시 분석") { model.analyze() }.keyboardShortcut("r").disabled(model.busy || !model.showFolderBatch || model.sources.isEmpty || !model.overlayDestinationConnected)

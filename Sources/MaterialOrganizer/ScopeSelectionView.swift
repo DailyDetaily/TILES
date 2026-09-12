@@ -8,7 +8,6 @@ struct ScopeSelectionView: View {
     @ObservedObject var review: ProjectReviewModel
     @ObservedObject var owner: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Namespace private var selection
     @State private var dragOver = false
     @State private var loadingDrop = false
 
@@ -27,20 +26,20 @@ struct ScopeSelectionView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if scope.mode == .files { files } else { folders }
-                    if let message = scope.error ?? scope.notice {
-                        Label(message, systemImage: scope.error == nil ? "info.circle" : "exclamationmark.circle")
+                    if let message = scope.error ?? review.failure ?? (!review.storeReadable ? "검토 기록을 읽을 수 없어 정리안을 만들 수 없습니다. 기존 기록은 보존됩니다." : scope.notice) {
+                        Label(message, systemImage: scope.error == nil && review.failure == nil && review.storeReadable ? "info.circle" : "exclamationmark.circle")
                             .font(Theme.body(11)).foregroundStyle(Theme.gray).fixedSize(horizontal: false, vertical: true)
-                    }
-                    if scope.preservedFolderCount > 0 {
-                        Text("기존 폴더 \(scope.preservedFolderCount)개는 구성 그대로 유지합니다.")
-                            .font(Theme.body(11)).foregroundStyle(Theme.gray)
                     }
                 }.padding(.vertical, 2)
             }
             HStack {
-                Text(scope.isScanning ? "대상 파일을 확인하고 있습니다…" : scope.canPreview ? "범위가 준비됐어요. 정리안을 확인하세요." : "범위를 고르면 정리할 파일 수를 알려드려요.")
+                Text(scope.summary)
                     .font(Theme.body(11)).foregroundStyle(Theme.gray)
                 Spacer(minLength: 4)
+                if scope.canRefresh {
+                    Button("다시 확인", action: scope.refresh).buttonStyle(.plain).font(Theme.body(11))
+                        .accessibilityIdentifier("scope-refresh")
+                }
                 if review.pendingCount > 0 {
                     Menu("나중에 정리 · \(review.pendingCount)") {
                         ForEach(review.batches) { batch in
@@ -78,7 +77,7 @@ struct ScopeSelectionView: View {
             .foregroundStyle(selected ? Color.white : Color.black)
             .background {
                 if selected {
-                    RoundedRectangle(cornerRadius: 8).fill(Color.black).matchedGeometryEffect(id: "scope-choice", in: selection)
+                    RoundedRectangle(cornerRadius: 8).fill(Color.black)
                 } else { RoundedRectangle(cornerRadius: 8).fill(Color.white) }
             }
             .contentShape(RoundedRectangle(cornerRadius: 8))
@@ -172,7 +171,7 @@ struct ScopeSelectionView: View {
             case .failure(let error): owner.error = error.localizedDescription
             }
         }
-        if !accepted { loadingDrop = false }
+        if !accepted { loadingDrop = false; owner.error = "일반 파일을 한 번에 1~500개 놓아 주세요. 더 많다면 폴더를 선택해 범위를 확인하세요." }
         return accepted
     }
 }

@@ -17,6 +17,7 @@ xcuserdata/
 AppState/
 Settings.json
 ReviewState.json
+ReviewRules.json
 WatchState.json
 
 # Local design work and UI verification fixtures

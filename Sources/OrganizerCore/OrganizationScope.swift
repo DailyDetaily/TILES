@@ -31,14 +31,15 @@ public enum OrganizationScopeDiscovery {
     public static let batchLimit = 500
 
     /// Source folders stay in place. Recursion includes eligible files only, and never follows links,
-    /// packages, hidden items, protected paths or code project directories.
+    /// packages, hidden items, protected paths, explicitly excluded subtrees or code projects.
     public static func scan(files: [URL], folders: [URL], includeSubfolders: Bool = false,
-                            rules: OrganizerRules, cancelled: () -> Bool = { false }) throws -> OrganizationScopeResult {
+                            excludedFolders: [URL] = [], rules: OrganizerRules, cancelled: () -> Bool = { false }) throws -> OrganizationScopeResult {
         try rules.validate()
         var result = OrganizationScopeResult()
         var visitedPaths = Set<String>()
         var fileIdentities = Set<String>()
         var ancestorSafety: [String: Bool] = [:]
+        let excludedRoots = excludedFolders.map(PathSafety.lexicalURL)
         let keys: Set<URLResourceKey> = [.isAliasFileKey, .isPackageKey, .isHiddenKey, .volumeIsLocalKey]
 
         func checkCancellation() throws { if cancelled() { throw CancellationError() } }
@@ -58,7 +59,7 @@ public enum OrganizationScopeDiscovery {
             ancestorSafety[parent.path] = safe
             return safe
         }
-        func visit(_ original: URL, rootFolder: Bool = false) throws {
+        func visit(_ original: URL, rootFolder: Bool = false, exclusions: [URL]) throws {
             try checkCancellation()
             guard original.isFileURL, original.host == nil || original.host == "" || original.host == "localhost",
                   original.query == nil, original.fragment == nil else { result.skippedCount += 1; return }
@@ -71,6 +72,9 @@ public enum OrganizationScopeDiscovery {
                 let identity = SafeFileSystem.identity(info)
                 let isFolder = identity.kind == "directory"
                 if isFolder && !rootFolder { result.preservedFolderCount += 1 }
+                if exclusions.contains(where: { PathSafety.contains($0, url) }) {
+                    result.skippedCount += 1; return
+                }
                 guard !FolderWatchPolicy.excludes(name: url.lastPathComponent),
                       info.st_flags & UInt32(UF_HIDDEN | SF_DATALESS) == 0,
                       try SafeFileSystem.protectionReason(url, rules: rules, includeDescendantPaths: false) == nil else {
@@ -87,7 +91,7 @@ public enum OrganizationScopeDiscovery {
                     let children = try SafeFileSystem.children(url)
                     for child in children {
                         if result.scanLimitReached { break }
-                        try visit(child)
+                        try visit(child, exclusions: exclusions)
                     }
                     guard try SafeFileSystem.identity(at: url) == initialIdentity else {
                         throw OrganizerError("확인하는 동안 폴더가 바뀌었습니다. 다시 선택해 주세요.")
@@ -108,14 +112,18 @@ public enum OrganizationScopeDiscovery {
         // Normalize aliases in system prefixes (such as /var) only after rejecting source links.
         for file in files.sorted(by: { $0.path < $1.path }) {
             if result.scanLimitReached { break }
-            try visit(file)
+            try visit(file, exclusions: excludedRoots)
         }
         for folder in folders.sorted(by: { $0.path.count == $1.path.count ? $0.path < $1.path : $0.path.count < $1.path.count }) {
             if result.scanLimitReached { break }
             // A nested root intentionally selected by the user must still be scanned when recursion is off.
             let key = PathSafety.lexicalURL(folder).path.precomposedStringWithCanonicalMapping
             if !includeSubfolders { visitedPaths.remove(key) }
-            try visit(folder, rootFolder: true)
+            // An explicitly selected nested source overrides exclusions inherited from its ancestors.
+            // Its own excluded descendants still apply, without reopening siblings of that source.
+            let root = PathSafety.lexicalURL(folder)
+            let rootExclusions = excludedRoots.filter { $0.path != root.path && PathSafety.contains(root, $0) }
+            try visit(folder, rootFolder: true, exclusions: rootExclusions)
         }
         try checkCancellation()
         result.files.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
@@ -159,6 +167,7 @@ public final class OrganizationScopeStateStore {
     private var blocked = false
     private let maximumBytes = 2 * 1_048_576
     public init(url: URL) { self.url = url }
+    public var isWritable: Bool { loaded && !blocked }
     public func load() throws -> OrganizationScopeState {
         do {
             let bytes = try existingBytes()

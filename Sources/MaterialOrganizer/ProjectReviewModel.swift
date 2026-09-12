@@ -37,8 +37,10 @@ struct ProjectReviewRow: Identifiable {
     var folder: String?
     var included = true
     var explicitlyAssigned = false
+    var ruleReason: String?
+    var ruleConflict = false
     var id: UUID { evidence.id }
-    var isReady: Bool { included && evidence.sourceIdentity != nil && evidence.readStatus != .cancelled && projectID != nil && folder != nil }
+    var isReady: Bool { included && !ruleConflict && evidence.sourceIdentity != nil && evidence.readStatus != .cancelled && projectID != nil && folder != nil }
 }
 
 @MainActor final class ProjectReviewModel: ObservableObject {
@@ -59,6 +61,7 @@ struct ProjectReviewRow: Identifiable {
     @Published var failure: String?
     @Published private(set) var storeReadable = true
     let owner: AppModel
+    let assistance: ProjectReviewAssistance
     private let stateURL: URL
     private var generation = UUID()
     private var analysisTask: Task<Void, Never>?
@@ -71,6 +74,7 @@ struct ProjectReviewRow: Identifiable {
 
     init(owner: AppModel) {
         self.owner = owner
+        assistance = ProjectReviewAssistance(stateDirectory: owner.stateDirectory)
         stateURL = owner.stateDirectory.appendingPathComponent("ReviewState.json")
         if owner.isDemo { workspaceRoot = owner.destination }
         load()
@@ -112,6 +116,7 @@ struct ProjectReviewRow: Identifiable {
     }
     func recommendationReason(_ row: ProjectReviewRow) -> String {
         if row.explicitlyAssigned, row.folder != nil { return "직접 지정한 정리 위치" }
+        if let reason = row.ruleReason { return reason }
         if isAutomaticLocation(row.projectID) {
             return "프로젝트 단서가 없어 원래 위치 안에서 확장자 기준으로 \(row.evidence.kind.label) 폴더를 추천했습니다."
         }
@@ -205,6 +210,62 @@ struct ProjectReviewRow: Identifiable {
         analyzeActive()
     }
 
+    /// The scope screen replaces the active selection exactly; Dock intake remains additive.
+    func receiveScope(_ urls: [URL], releaseAccess: (() -> Void)? = nil) {
+        guard storeReadable else {
+            releaseAccess?(); failure = "대기 목록을 읽을 수 없어 선택한 범위를 저장하지 않았습니다."; return
+        }
+        guard !owner.busy else {
+            releaseAccess?(); failure = "진행 중인 작업을 마친 뒤 정리할 범위를 다시 선택해 주세요."; return
+        }
+        guard !urls.isEmpty, urls.count <= 500, urls.allSatisfy(Self.isLocalFileURL) else {
+            releaseAccess?(); failure = "이 Mac의 파일을 한 번에 1~500개 선택해 주세요."; return
+        }
+        let previous = mutationSnapshot()
+        saveActiveChoices()
+        let unique = Array(Dictionary(urls.map { (Self.queueKey($0.path), $0) }, uniquingKeysWith: { first, _ in first }).values)
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        let selectedKeys = Set(unique.map { Self.queueKey($0.path) })
+        let previousActiveFiles = batches.first(where: { $0.id == activeBatchID })?.files ?? []
+        let previousActiveKeys = Set(previousActiveFiles.map { Self.queueKey($0.path) })
+        let saved = Dictionary((previousActiveFiles + batches.filter { $0.id != activeBatchID }.flatMap(\.files))
+            .map { (Self.queueKey($0.path), $0) }, uniquingKeysWith: { first, _ in first })
+        let exactFiles = unique.map { url in
+            let incoming = savedFile(url)
+            guard var previous = saved[Self.queueKey(url.path)] else { return incoming }
+            if let bookmark = incoming.bookmark { previous.bookmark = bookmark }
+            return previous
+        }
+        for index in batches.indices {
+            batches[index].files.removeAll { selectedKeys.contains(Self.queueKey($0.path)) }
+        }
+        batches.removeAll { $0.files.isEmpty }
+        guard batches.count < Self.maximumBatches else {
+            restore(previous)
+            releaseAccess?(); failure = "확인 대기 묶음이 많습니다. 기존 묶음을 정리한 뒤 다시 선택해 주세요."; return
+        }
+        let previousScopeKeys = Set(scopedFiles.keys)
+        for url in unique { acquireScope(url) }
+        let batch = ReviewQueuedBatch(origin: "선택한 범위", files: exactFiles)
+        batches.append(batch); activeBatchID = batch.id
+        rows = []; lastRun = nil; invalidatePlan(); failure = nil
+        guard persist() else {
+            restore(previous)
+            releaseScopes(except: previousScopeKeys)
+            releaseAccess?()
+            return
+        }
+        // A borrowed folder grant can cover retained files even when their URL has no grant of its own.
+        // Keep it until the retained selection closes, or until a completely disjoint scope replaces it.
+        if selectedKeys.isDisjoint(with: previousActiveKeys) {
+            let previousReleases = externalAccess; externalAccess = []; previousReleases.forEach { $0() }
+        }
+        if let releaseAccess { externalAccess.append(releaseAccess) }
+        releaseScopes(except: Set(exactFiles.map(\.path)).union(unique.map { PathSafety.lexicalURL($0).path }))
+        owner.projectReviewActive = true; owner.showFolderBatch = false; owner.page = .organize
+        analyzeActive()
+    }
+
     private static func queueKey(_ path: String) -> String {
         PathSafety.lexicalURL(URL(fileURLWithPath: path)).path.precomposedStringWithCanonicalMapping
     }
@@ -273,13 +334,17 @@ struct ProjectReviewRow: Identifiable {
                 let changed = saved?.version != nil && saved?.version != value.sourceVersion
                 let savedProject = changed ? nil : self.project(saved?.projectID)
                 let candidate = value.projectMatch == .unique ? self.project(value.projectCandidates.first?.projectID) : nil
-                // Re-evaluate automatic fallbacks when project evidence changes. Explicit choices survive.
-                let preserved = savedProject.flatMap { project in
-                    self.isAutomaticLocation(project.id) && !(saved?.explicitlyAssigned ?? false) ? nil : project
-                }
-                var selectedProject = preserved ?? candidate
+                // Only explicit choices survive reanalysis. Recommendations must reflect current rules.
+                let preserved = (saved?.explicitlyAssigned ?? false) ? savedProject : nil
+                let resolution = ProjectReviewRuleResolver.resolve(evidence: value, projects: self.projects, rules: self.assistance.rules)
+                let ruleConflict = preserved == nil && resolution.conflict
+                let ruleTarget = !ruleConflict ? self.project(resolution.projectID) : nil
+                var selectedProject = preserved ?? (ruleConflict ? nil : ruleTarget ?? candidate)
                 var folder = preserved != nil ? saved?.folder : nil
-                if selectedProject == nil, value.projectMatch == .unknown,
+                if preserved == nil, ruleTarget != nil { folder = resolution.folder }
+                let ruleReason = preserved == nil ? resolution.reason : nil
+                if let ruleReason { value.reasons.append(ruleReason) }
+                if selectedProject == nil, !ruleConflict, value.projectMatch == .unknown,
                    value.sourceIdentity != nil, value.readStatus != .cancelled, value.readStatus != .invalidFile {
                     do {
                         selectedProject = try self.managedLocation(at: URL(fileURLWithPath: value.sourcePath).deletingLastPathComponent())
@@ -291,7 +356,8 @@ struct ProjectReviewRow: Identifiable {
                 if folder == nil, let project = selectedProject { folder = value.suggestedFolder(for: project) }
                 return .init(evidence: value, projectID: selectedProject?.id, folder: folder,
                              included: (saved?.included ?? true) && value.sourceIdentity != nil && !changed,
-                             explicitlyAssigned: !changed && (saved?.explicitlyAssigned ?? false))
+                             explicitlyAssigned: !changed && (saved?.explicitlyAssigned ?? false),
+                             ruleReason: ruleReason, ruleConflict: ruleConflict)
             }
             if cancellation.cancelled { self.notice = "분석을 중단했습니다. 다시 분석하거나 파일을 보류할 수 있습니다." }
             self.saveActiveChoices(); self.persist()
@@ -312,6 +378,7 @@ struct ProjectReviewRow: Identifiable {
         for index in rows.indices where rowID == rows[index].id || (rowID == nil && rows[index].included) {
             rows[index].projectID = projectID; rows[index].folder = rows[index].evidence.suggestedFolder(for: project)
             rows[index].explicitlyAssigned = true
+            rows[index].ruleReason = nil; rows[index].ruleConflict = false
         }
         choicesChanged()
     }
@@ -322,8 +389,48 @@ struct ProjectReviewRow: Identifiable {
             guard let project = project(rows[index].projectID), folder.isEmpty || project.folders.contains(folder) || project.template == .byMonth else { continue }
             rows[index].folder = folder
             rows[index].explicitlyAssigned = true
+            rows[index].ruleReason = nil; rows[index].ruleConflict = false
         }
         choicesChanged()
+    }
+
+    func selectGroup(_ id: String) {
+        guard !owner.busy, let group = clarificationGroups.first(where: { $0.id == id }) else { return }
+        let previous = mutationSnapshot()
+        for index in rows.indices { rows[index].included = group.rowIDs.contains(rows[index].id) }
+        invalidatePlan(); saveActiveChoices()
+        if !persist() { restore(previous) }
+    }
+
+    func deferGroup(_ id: String) {
+        mutateGroup(id) { $0.included = false }
+    }
+
+    func assignProject(_ projectID: UUID, toGroup groupID: String) {
+        guard let project = project(projectID) else { return }
+        mutateGroup(groupID) { row in
+            row.projectID = projectID; row.folder = row.evidence.suggestedFolder(for: project)
+            row.explicitlyAssigned = true; row.ruleReason = nil; row.ruleConflict = false
+        }
+    }
+
+    func assignFolder(_ folder: String, toGroup groupID: String) {
+        guard let project = projectForGroup(groupID) else { return }
+        guard folder.isEmpty || ((try? ProjectFolderTree.validatePath(folder)) != nil &&
+            (project.folders.contains(folder) || project.template == .byMonth)) else {
+            failure = "현재 프로젝트에 있는 하위 폴더를 선택해 주세요."; return
+        }
+        mutateGroup(groupID) { row in
+            row.folder = folder; row.explicitlyAssigned = true; row.ruleReason = nil; row.ruleConflict = false
+        }
+    }
+
+    private func mutateGroup(_ id: String, _ change: (inout ProjectReviewRow) -> Void) {
+        guard !owner.busy, storeReadable, let group = clarificationGroups.first(where: { $0.id == id }) else { return }
+        let previous = mutationSnapshot()
+        for index in rows.indices where group.rowIDs.contains(rows[index].id) { change(&rows[index]) }
+        invalidatePlan(); saveActiveChoices()
+        if !persist() { restore(previous) }
     }
 
     func chooseDestinationFolder(for rowID: UUID? = nil) {
@@ -349,10 +456,11 @@ struct ProjectReviewRow: Identifiable {
             }
             for index in affected {
                 rows[index].projectID = location.id; rows[index].folder = ""; rows[index].explicitlyAssigned = true
+                rows[index].ruleReason = nil; rows[index].ruleConflict = false
             }
             invalidatePlan(); saveActiveChoices()
             guard persist() else { restore(previous); return false }
-            owner.remember(url); failure = nil
+            owner.remember(url); owner.persist(invalidateFolders: false); failure = nil
             return true
         } catch { restore(previous); failure = error.localizedDescription; return false }
     }
@@ -384,6 +492,7 @@ struct ProjectReviewRow: Identifiable {
             }
             let root = URL(fileURLWithPath: project.rootPath)
             try Planner.validateDestination(root, rules: owner.rules)
+            automaticLocationRoots.removeValue(forKey: project.id)
             if let index = projects.firstIndex(where: { $0.id == project.id }) { projects[index] = project }
             else { projects.append(project) }
             if applyToIncluded {
@@ -391,6 +500,7 @@ struct ProjectReviewRow: Identifiable {
                     rows[index].projectID = project.id
                     rows[index].folder = rows[index].evidence.suggestedFolder(for: project)
                     rows[index].explicitlyAssigned = true
+                    rows[index].ruleReason = nil; rows[index].ruleConflict = false
                 }
             }
             else {
@@ -400,6 +510,7 @@ struct ProjectReviewRow: Identifiable {
                     }
                 }
             }
+            revalidateRuleDestinations()
             invalidatePlan(); saveActiveChoices()
             guard persist() else { restore(previous); return false }
             showProjectSetup = false; editingProject = nil; failure = nil
@@ -412,6 +523,7 @@ struct ProjectReviewRow: Identifiable {
 
     func prepare(folderOnly projectID: UUID? = nil) {
         guard !owner.busy, storeReadable else { return }
+        revalidateRuleDestinations()
         let chosenRows = projectID == nil ? rows.filter(\.isReady) : []
         let ids = projectID.map { Set([$0]) } ?? Set(chosenRows.compactMap(\.projectID))
         let targets = projects.filter { ids.contains($0.id) }
@@ -523,6 +635,7 @@ struct ProjectReviewRow: Identifiable {
         guard !owner.busy else { return }
         batches.removeAll { $0.id == id }
         if activeBatchID == id { activeBatchID = nil; rows = []; invalidatePlan(); owner.projectReviewActive = false; releaseAccess() }
+        pruneUnusedAutomaticLocations()
         persist()
     }
 
@@ -583,9 +696,21 @@ struct ProjectReviewRow: Identifiable {
     private func pruneUnusedAutomaticLocations() {
         let retained = Set(batches.flatMap { $0.files.compactMap(\.projectID) })
             .union(lastRun == nil ? rows.compactMap(\.projectID) : [])
+            .union(assistance.rules.map(\.projectID))
         let obsolete = Set(automaticLocationRoots.keys).subtracting(retained)
         projects.removeAll { obsolete.contains($0.id) }
         for id in obsolete { automaticLocationRoots.removeValue(forKey: id) }
+    }
+
+    /// A project edit may invalidate a saved destination without rereading the source. Never let
+    /// an already displayed rule silently follow a renamed/relocated project into a new plan.
+    private func revalidateRuleDestinations() {
+        for index in rows.indices where !rows[index].explicitlyAssigned && rows[index].ruleReason != nil {
+            let resolution = ProjectReviewRuleResolver.resolve(evidence: rows[index].evidence, projects: projects, rules: assistance.rules)
+            guard resolution.conflict else { continue }
+            rows[index].projectID = nil; rows[index].folder = nil
+            rows[index].ruleConflict = true; rows[index].ruleReason = resolution.reason
+        }
     }
 
     private func load() {

@@ -44,10 +44,46 @@ struct ContentView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var review: ProjectReviewModel
     @ObservedObject var watch: FolderWatchService
+    @ObservedObject var scope: ScopeSelectionModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var motion = PuzzleMotionController()
     private var projectFlow: Bool { !model.showFolderBatch && (model.projectReviewActive || model.quickFile == nil) }
-    private var expanded: Bool { review.isActive || review.pendingCount > 0 || model.plan != nil || model.quickFile != nil || model.quickRun != nil || model.showFolderBatch || model.page != .organize }
+    private var phase: PuzzlePhase {
+        if projectFlow {
+            if review.lastRun != nil { return .completion }
+            if review.preparedPlan != nil { return .preview }
+            if review.isActive { return .recommendation }
+            return .intake
+        }
+        if model.quickRun != nil { return .completion }
+        if model.confirmExecute { return .preview }
+        if model.plan != nil || model.quickFile != nil { return .recommendation }
+        return .intake
+    }
+    private var expanded: Bool {
+        model.page != .organize || model.showFolderBatch || (phase != .intake && phase != .completion)
+    }
+    private var phaseTitle: String {
+        switch phase {
+        case .intake: return "정리할 범위를 골라요"
+        case .recommendation: return review.isAnalyzing ? "정리 위치를 찾고 있어요" : "추천 위치를 확인해요"
+        case .preview: return "이대로 정리할까요?"
+        case .completion: return review.lastRun?.state == .undone ? "원래 위치로 돌아왔어요" : review.lastRun?.state == .completed ? "정리가 끝났어요" : "정리 결과를 확인해요"
+        }
+    }
+    private var activeFileCount: Int {
+        review.rows.isEmpty ? review.batches.first(where: { $0.id == review.activeBatchID })?.files.count ?? 0 : review.rows.count
+    }
+    private var laterCount: Int {
+        if phase == .intake || phase == .completion { return review.pendingCount }
+        return review.batches.filter { $0.id != review.activeBatchID }.reduce(0) { $0 + $1.files.count }
+    }
+    private var stepNumber: String {
+        switch phase { case .intake: return "01"; case .recommendation: return "02"; case .preview, .completion: return "03" }
+    }
+    private func startNewScope() {
+        review.returnToInbox(); model.resetQuickMove(); model.invalidate(); scope.resetSelection(); model.showFolderBatch = false; model.page = .organize
+    }
     var body: some View {
         GeometryReader { proxy in
             let availableWidth = max(1, proxy.size.width - 32)
@@ -75,6 +111,7 @@ struct ContentView: View {
         .font(Theme.body()).tracking(0.14).foregroundStyle(Color.black).background(Color.white)
         .onChange(of: model.page, initial: true) { _, _ in updateMotion() }
         .onChange(of: expanded) { _, _ in updateMotion() }
+        .onChange(of: phase) { _, _ in updateMotion() }
         .onChange(of: reduceMotion) { _, _ in updateMotion() }
         .onDisappear { motion.stop() }
         .sheet(isPresented: $model.confirmExecute) { confirmation }
@@ -91,7 +128,7 @@ struct ContentView: View {
             }.padding(32).frame(width: 670).background(Color.white).font(Theme.body()).preferredColorScheme(.light)
         }
     }
-    private func updateMotion() { motion.request(page: model.page, expanded: expanded, reduced: reduceMotion) }
+    private func updateMotion() { motion.request(page: model.page, expanded: expanded, phase: phase, reduced: reduceMotion) }
     private func navigation(_ grid: BentoGeometry, height: CGFloat) -> some View {
         HStack {
             TileWordmark(cue: model.wordmarkCue)
@@ -110,7 +147,57 @@ struct ContentView: View {
             }
         }.padding(.leading, 18).frame(width: grid.width, height: height)
     }
-    private func sourceTile(_ grid: BentoGeometry) -> some View {
+    @ViewBuilder private func sourceTile(_ grid: BentoGeometry) -> some View {
+        if projectFlow && model.page == .organize {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("01 / SCOPE").font(Theme.body(10)).tracking(1)
+                Image(systemName: scope.mode == .files ? "doc.on.doc" : "folder").font(.system(size: 26, weight: .light)).accessibilityHidden(true)
+                Text(phase == .intake ? "선택한 범위" : "정리할 파일").font(Theme.body(15)).fontWeight(.semibold)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if phase != .intake {
+                            Text("\(activeFileCount)개 파일").font(Theme.body(14))
+                            ForEach(review.rows.prefix(5)) { row in
+                                Text(row.evidence.name).font(Theme.body(11)).lineLimit(2).help(row.evidence.sourcePath)
+                            }
+                        } else if scope.mode == .files {
+                            Text(scope.selectedFiles.isEmpty ? "아직 선택하지 않았어요" : "파일 \(scope.selectedFiles.count)개").font(Theme.body(12)).foregroundStyle(Theme.gray)
+                            ForEach(scope.selectedFiles.prefix(4), id: \.path) { url in Text(url.lastPathComponent).font(Theme.body(11)).lineLimit(2).help(url.path) }
+                        } else {
+                            Text(scope.selectedLocationCount == 0 ? "위치를 선택해 주세요" : "\(scope.selectedLocationCount)곳 선택").font(Theme.body(12)).foregroundStyle(Theme.gray)
+                            ForEach(scope.locations.filter(\.selected)) { location in Text(location.name).font(Theme.body(12)).help(location.path) }
+                            Text(scope.includeSubfolders ? "하위 폴더 포함" : "바로 안의 파일만").font(Theme.body(10)).foregroundStyle(Theme.gray)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if phase != .intake {
+                    Button("범위 다시 선택") { review.returnToInbox(); scope.refresh() }
+                        .buttonStyle(PillStyle(filled: false, gridHeight: grid.smallCell / 2)).disabled(model.busy)
+                        .accessibilityIdentifier("scope-back")
+                }
+            }.padding(18).tile()
+        } else { legacySourceTile(grid) }
+    }
+    @ViewBuilder private func destinationTile(_ grid: BentoGeometry) -> some View {
+        if projectFlow && model.page == .organize {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("02 / SUGGEST").font(Theme.body(10)).tracking(1)
+                Image(systemName: "folder.badge.gearshape").font(.system(size: 26, weight: .light)).accessibilityHidden(true)
+                Text("정리 위치는\n자동으로").font(Theme.body(17)).fontWeight(.semibold)
+                if phase == .intake {
+                    Text("기존 프로젝트와 파일 종류를 살펴보고 알맞은 폴더를 제안해요.").font(Theme.body(12)).foregroundStyle(Theme.gray)
+                } else if let project = review.singleSelectedProject {
+                    PathText(path: project.rootPath)
+                    Text("파일별 위치는 오른쪽에서 확인할 수 있어요.").font(Theme.body(11)).foregroundStyle(Theme.gray)
+                } else {
+                    Text("각 파일의 추천 위치를 확인하고 필요한 곳만 바꾸세요.").font(Theme.body(12)).foregroundStyle(Theme.gray)
+                }
+                Spacer(minLength: 0)
+                Text(phase == .preview ? "실행 전까지\n원본은 그대로" : "추천이 맞으면\n한 번에 정리").font(Theme.body(11)).foregroundStyle(Theme.gray)
+            }.padding(18).tile()
+        } else { legacyDestinationTile(grid) }
+    }
+    private func legacySourceTile(_ grid: BentoGeometry) -> some View {
         VStack(spacing: grid.gap) {
             VStack(alignment: .leading, spacing: 14) {
                 Text("01 / FILE").font(Theme.body(10)).tracking(1)
@@ -123,7 +210,7 @@ struct ContentView: View {
                             }
                             if model.sources.isEmpty { Text("폴더 선택 전").font(Theme.body(12)).foregroundStyle(Theme.gray) }
                         } else if projectFlow, !review.rows.isEmpty {
-                            Text("\(review.rows.count)개 파일").font(Theme.body(14)).fontWeight(.medium)
+                            Text("\(activeFileCount)개 파일").font(Theme.body(14)).fontWeight(.medium)
                             ForEach(review.rows.prefix(5)) { row in Text(row.evidence.name).font(Theme.body(11)).lineLimit(1).help(row.evidence.sourcePath) }
                             if review.rows.count > 5 { Text("외 \(review.rows.count - 5)개").font(Theme.body(11)).foregroundStyle(Theme.gray) }
                         } else if let file = model.quickFile {
@@ -138,7 +225,7 @@ struct ContentView: View {
             }.buttonStyle(PillStyle(gridHeight: grid.smallCell / 2)).disabled(model.busy)
         }
     }
-    private func destinationTile(_ grid: BentoGeometry) -> some View {
+    private func legacyDestinationTile(_ grid: BentoGeometry) -> some View {
         VStack(spacing: grid.gap) {
             VStack(alignment: .leading, spacing: 14) {
                 Text("02 / FOLDER").font(Theme.body(10)).tracking(1)
@@ -168,24 +255,34 @@ struct ContentView: View {
         }
     }
     private func headline(_ grid: BentoGeometry) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("TILES / \(model.page == .history ? "HISTORY" : model.page == .rules ? "SETTINGS" : "ORGANIZE")").font(Theme.body(9)).tracking(1)
-                Spacer()
-                Image(systemName: "arrow.up.right").font(.system(size: 13)).accessibilityHidden(true)
-            }
+        VStack(alignment: .leading, spacing: 10) {
+            Text("TILES / \(model.page == .history ? "HISTORY" : model.page == .rules ? "SETTINGS" : "ORGANIZE")").font(Theme.body(9)).tracking(1)
             Spacer(minLength: 0)
-            Text(model.page == .history ? "이동 기록" : model.page == .rules ? "설정" : model.showFolderBatch ? "폴더 전체 정리" : "파일 정리")
-                .font(Theme.body(22)).fontWeight(.semibold)
-            Text(model.page == .history ? "완료한 이동을 확인하고 되돌립니다." : model.page == .rules ? "추천과 정리 방식을 설정합니다." : projectFlow ? "파일 선택 → 프로젝트 확인 → 정리" : "파일 선택 → 폴더 선택 → 이동")
-                .font(Theme.body(12)).lineLimit(2)
+            Text(model.page == .history ? "이동 기록" : model.page == .rules ? "설정" : model.showFolderBatch ? "폴더 전체 정리" : phaseTitle)
+                .font(Theme.display(min(29, grid.cell * 0.19))).lineLimit(1).minimumScaleFactor(0.8)
+            if model.page == .organize && projectFlow {
+                HStack(spacing: 12) {
+                    phaseLabel("01 범위", active: phase == .intake)
+                    Text("→")
+                    phaseLabel("02 추천", active: phase == .recommendation)
+                    Text("→")
+                    phaseLabel("03 정리", active: phase == .preview || phase == .completion)
+                }.font(Theme.body(11))
+            } else {
+                Text(model.page == .history ? "완료한 이동을 확인하고 되돌립니다." : model.page == .rules ? "추천과 정리 방식을 설정합니다." : "폴더 선택 → 미리보기 → 이동")
+                    .font(Theme.body(12)).lineLimit(2)
+            }
         }.padding(18).tile(Theme.blue)
+    }
+    private func phaseLabel(_ title: String, active: Bool) -> some View {
+        Text(title).fontWeight(active ? .bold : .regular).opacity(active ? 1 : 0.55)
+            .accessibilityAddTraits(active ? .isSelected : [])
     }
     private func totalTile(_ grid: BentoGeometry) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(model.page == .history ? "HISTORY" : model.page == .rules ? "RULES" : "STEP").font(Theme.body(9)).tracking(1)
             Spacer(minLength: 0)
-            PuzzleCounter(value: model.page == .history ? "\(model.records.count)" : model.page == .rules ? "\(review.projects.count)" : review.lastRun != nil || model.quickRun != nil ? "03" : review.isActive || model.quickFile != nil || model.plan != nil ? "02" : "01", size: grid.cell * 0.34, ink: .white, paper: .black, maximumWidth: grid.cell - 36)
+            PuzzleCounter(value: model.page == .history ? "\(model.records.count)" : model.page == .rules ? "\(review.projects.count)" : stepNumber, size: grid.cell * 0.34, ink: .white, paper: .black, maximumWidth: grid.cell - 36)
         }.padding(18).foregroundStyle(Color.white).tile(Color.black)
     }
     private func metrics(_ grid: BentoGeometry) -> some View {
@@ -194,9 +291,26 @@ struct ContentView: View {
             if model.showFolderBatch, model.plan != nil {
                 HStack(spacing: grid.gap) { detailCell("이동 가능", "\(model.executable.count)", side, blue: true); detailCell("유지", "\(model.count(.keep))", side) }
                 HStack(spacing: grid.gap) { detailCell("분류 필요", "\(model.count(.review))", side); detailCell("제외", "\(model.count(.excluded))", side) }
+            } else if projectFlow, let run = review.lastRun {
+                let restoredCount = run.entries.filter { $0.state == .undone }.count
+                let processedCount = run.state == .undone ? restoredCount : run.movedCount
+                HStack(spacing: grid.gap) {
+                    detailCell("전체 파일", "\(activeFileCount)개", side, blue: true)
+                    detailCell(run.state == .undone ? "복원 완료" : "이동 완료", "\(processedCount)개", side)
+                }
+                HStack(spacing: grid.gap) {
+                    detailCell("원래 위치", "\(run.state == .undone ? activeFileCount : max(0, activeFileCount - run.movedCount))개", side)
+                    detailCell("나중에 정리", "\(laterCount)개", side)
+                }
             } else if projectFlow {
-                HStack(spacing: grid.gap) { detailCell("파일", "\(review.rows.count)개", side, blue: true); detailCell("이동 준비", "\(review.readyCount)개", side) }
-                HStack(spacing: grid.gap) { detailCell("확인 필요", "\(review.unresolvedCount)개", side); detailCell("확인 대기", "\(review.pendingCount)개", side) }
+                HStack(spacing: grid.gap) {
+                    detailCell(phase == .intake ? "대상 파일" : "전체 파일", phase == .intake && scope.isScanning ? "확인 중" : "\(phase == .intake ? scope.candidateCount : activeFileCount)개", side, blue: true)
+                    detailCell(phase == .intake ? "선택 위치" : "정리 준비", "\(phase == .intake ? scope.selectedLocationCount : review.readyCount)개", side)
+                }
+                HStack(spacing: grid.gap) {
+                    detailCell(phase == .intake ? "폴더 유지" : "확인 필요", "\(phase == .intake ? scope.preservedFolderCount : review.unresolvedCount)개", side)
+                    detailCell("나중에 정리", "\(laterCount)개", side)
+                }
             } else {
                 HStack(spacing: grid.gap) { detailCell("FILE", model.quickFile?.pathExtension.uppercased().isEmpty == false ? model.quickFile!.pathExtension.uppercased() : "1개씩", side, blue: true); detailCell("NAME", "이름 유지", side) }
                 HStack(spacing: grid.gap) { detailCell("MOVE", "직접 선택", side); detailCell("HISTORY", "되돌리기", side) }
@@ -214,7 +328,10 @@ struct ContentView: View {
             switch model.page {
             case .organize:
                 if model.showFolderBatch { BatchOrganizeView(model: model, embedded: true) }
-                else if projectFlow { ProjectReviewView(review: review, owner: model, embedded: true) }
+                else if projectFlow {
+                    if phase == .intake { ScopeSelectionView(scope: scope, review: review, owner: model) }
+                    else { ProjectReviewView(review: review, owner: model, embedded: true) }
+                }
                 else { FileOrganizeView(model: model, embedded: true) }
             case .history: HistoryView(model: model)
             case .rules: RulesView(model: model, review: review, watch: watch)
@@ -225,38 +342,46 @@ struct ContentView: View {
     private func actionTile(_ grid: BentoGeometry) -> some View {
         VStack(spacing: grid.gap) {
             VStack(alignment: .leading, spacing: 8) {
-                Text("03 / MOVE").font(Theme.body(9)).tracking(1)
+                Text("NEXT / \(stepNumber)").font(Theme.body(9)).tracking(1)
                 Spacer(minLength: 0)
-                if model.busy { ProgressView().controlSize(.small) }
-                else { Image(systemName: model.quickRun?.state == .completed ? "checkmark" : "arrow.right").font(.system(size: 26, weight: .light)).accessibilityHidden(true) }
-                Text(model.busy ? "확인 중" : review.lastRun != nil || model.quickRun != nil ? "기록 저장됨" : review.preparedPlan != nil || model.quickDestination != nil || model.plan != nil ? "이동 준비" : "확인하고 정리")
-                    .font(Theme.body(12)).lineLimit(1)
+                if model.busy || scope.isScanning { ProgressView().controlSize(.small) }
+                else { Image(systemName: phase == .completion ? "checkmark" : "arrow.right").font(.system(size: 26, weight: .light)).accessibilityHidden(true) }
+                Text(model.busy ? "확인 중" : phase == .intake ? "추천 위치 찾기" : phase == .recommendation ? "이동 전 최종 확인" : phase == .preview ? "선택한 파일 정리" : "다음 정리 시작")
+                    .font(Theme.body(12)).lineLimit(2)
             }.padding(12).tile(Theme.blue)
-            Group {
-                if model.busy { Button("중단", action: model.cancel).disabled(model.quickRun != nil || model.page == .history) }
-                else if model.page != .organize { Button("파일 선택…", action: model.chooseFile) }
-                else if model.showFolderBatch {
-                    if model.plan == nil { Button("미리보기", action: model.analyze).disabled(model.sources.isEmpty || !model.overlayDestinationConnected) }
-                    else { Button("\(model.chosen.count)개 이동…") { model.confirmExecute = true }.disabled(model.chosen.isEmpty) }
-                } else if projectFlow {
-                    if review.lastRun != nil { Button("확인 대기", action: review.returnToInbox) }
-                    else if let plan = review.preparedPlan {
-                        Button(plan.proposals.isEmpty ? "폴더 만들기" : "\(plan.proposals.count)개 정리", action: review.executePrepared)
-                            .disabled(plan.proposals.isEmpty && review.newDirectoryPaths.isEmpty)
-                    } else if review.isActive { Button("이동안 확인") { review.prepare() }.disabled(!review.canPreview) }
-                    else { Button("파일 선택…", action: model.chooseFile) }
-                } else if model.quickRun != nil { Button("다음 파일…", action: model.chooseFile) }
-                else { Button("이동", action: model.executeQuickMove).disabled(model.quickDestination == nil) }
-            }.buttonStyle(PillStyle(gridHeight: grid.smallCell / 2))
+            primaryAction.buttonStyle(PillStyle(gridHeight: max(34, grid.smallCell / 2)))
         }
+    }
+    @ViewBuilder private var primaryAction: some View {
+        if model.busy { Button("중단", action: model.cancel).disabled(model.quickRun != nil || model.page == .history) }
+        else if model.page != .organize { Button("새 정리", action: startNewScope) }
+        else if model.showFolderBatch {
+            if model.plan == nil { Button("미리보기", action: model.analyze).disabled(model.sources.isEmpty || !model.overlayDestinationConnected) }
+            else { Button("\(model.chosen.count)개 이동…") { model.confirmExecute = true }.disabled(model.chosen.isEmpty) }
+        } else if projectFlow {
+            if phase == .completion { Button("새 정리", action: startNewScope).accessibilityIdentifier("organize-new") }
+            else if let plan = review.preparedPlan {
+                Button(plan.proposals.isEmpty ? "폴더 만들기" : "\(plan.proposals.count)개 정리", action: review.executePrepared)
+                    .disabled(plan.proposals.isEmpty && review.newDirectoryPaths.isEmpty).accessibilityIdentifier("review-execute")
+            } else if review.isActive {
+                Button("이동안 확인") { review.prepare() }.disabled(!review.canPreview).accessibilityIdentifier("review-prepare")
+            } else if scope.isScanning {
+                Button("확인 중단", action: scope.cancel)
+            } else {
+                Button("정리안 보기") { scope.preview(using: review) }.disabled(!scope.canPreview || !review.storeReadable)
+                    .accessibilityIdentifier("scope-preview")
+            }
+        } else if model.quickRun != nil { Button("다음 파일…", action: model.chooseFile) }
+        else { Button("이동", action: model.executeQuickMove).disabled(model.quickDestination == nil) }
     }
     private var guideTile: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Image(systemName: model.page == .history ? "arrow.uturn.backward" : "arrow.right").font(.system(size: 40, weight: .light)).accessibilityHidden(true)
+            Image(systemName: phase == .completion || model.page == .history ? "arrow.uturn.backward" : "arrow.right")
+                .font(.system(size: 34, weight: .light)).accessibilityHidden(true)
             Spacer(minLength: 0)
-            Text(model.page == .history ? "기록에서 복구" : model.page == .rules ? "필요할 때만 설정" : projectFlow ? review.lastRun != nil ? "정리 기록 저장" : review.isActive ? "프로젝트별로 정리" : "여러 파일을 한 번에" : model.quickRun != nil ? "이동 기록 저장" : model.quickFile == nil ? "파일부터 선택" : model.quickDestination == nil ? "옮길 폴더 선택" : "확인하고 이동")
-                .font(Theme.body(14)).fontWeight(.medium).fixedSize(horizontal: false, vertical: true)
-            Text(model.page == .history ? "작업별로 원래 위치를 확인할 수 있습니다." : model.page == .rules ? "감시할 폴더와 정리 방식을 선택합니다." : projectFlow ? "추천 위치를 확인하고 실행하세요. 정리 내역에서 되돌릴 수 있습니다." : model.quickRun != nil ? "완료한 이동은 되돌릴 수 있습니다." : model.quickFile == nil ? "파일을 놓거나 선택 버튼을 누르세요." : model.quickDestination == nil ? "추천 폴더를 고르거나 새로 만드세요." : "선택한 폴더로 파일을 옮깁니다.")
+            Text(model.page == .history ? "기록에서 복구" : model.page == .rules ? "나에게 맞게" : phase == .intake ? "범위만 고르면\n위치는 알아서" : phase == .recommendation ? "맞는 추천은\n그대로" : phase == .preview ? "확인한 만큼\n한 번에" : "필요하면\n되돌리기")
+                .font(Theme.body(17)).fontWeight(.semibold).fixedSize(horizontal: false, vertical: true)
+            Text(model.page != .organize ? "완료한 작업은 기록에 남습니다." : phase == .intake ? "파일 · 선택 폴더 · 전체 중에서 시작하세요." : phase == .recommendation ? "틀린 위치만 바꾸세요. 확인 필요한 파일은 남겨둡니다." : phase == .preview ? "정리를 누르면 표시한 위치로 이동합니다." : "이동 내역을 확인하고 원래 위치로 복구할 수 있어요.")
                 .font(Theme.body(11)).foregroundStyle(Theme.gray).fixedSize(horizontal: false, vertical: true)
         }.padding(18).tile()
     }

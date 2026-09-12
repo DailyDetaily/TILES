@@ -114,7 +114,8 @@ final class ProjectReviewFlowTests: XCTestCase {
         let fixture = try Fixture(); defer { fixture.cleanup() }
         let project = fixture.project()
         XCTAssertTrue(fixture.review.saveProject(project, applyToIncluded: false))
-        let ready = try fixture.file("Atlas-note.txt"), unresolved = try fixture.file("unrelated.txt")
+        XCTAssertTrue(fixture.review.saveProject(fixture.project("Boreal"), applyToIncluded: false))
+        let ready = try fixture.file("Atlas-note.txt"), unresolved = try fixture.file("Atlas-Boreal.txt")
         fixture.owner.acceptFilesForReview([ready, unresolved])
         try await waitUntilIdle(fixture)
         XCTAssertEqual(fixture.review.readyCount, 1); XCTAssertEqual(fixture.review.unresolvedCount, 1)
